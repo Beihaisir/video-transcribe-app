@@ -7,15 +7,19 @@ import streamlit as st
 from faster_whisper import WhisperModel
 
 
+# =========================
+# 页面配置
+# =========================
+
 st.set_page_config(
-    page_title="贵州话视频转文字 / 字幕工具",
+    page_title="视频转文字 / 字幕工具",
     page_icon="🎬",
     layout="centered",
 )
 
 
 # =========================
-# 基础工具
+# 基础工具函数
 # =========================
 
 def check_ffmpeg_available() -> bool:
@@ -23,7 +27,7 @@ def check_ffmpeg_available() -> bool:
 
 
 def run_command(command):
-    subprocess.run(
+    return subprocess.run(
         command,
         check=True,
         stdout=subprocess.PIPE,
@@ -31,46 +35,13 @@ def run_command(command):
     )
 
 
-def extract_audio(video_path: str, audio_path: str):
-    """
-    从视频中提取 16kHz 单声道 WAV 音频。
-    """
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i", video_path,
-        "-vn",
-        "-acodec", "pcm_s16le",
-        "-ar", "16000",
-        "-ac", "1",
-        audio_path,
-    ]
-    run_command(command)
+def get_file_size_mb(uploaded_file) -> float:
+    return uploaded_file.size / 1024 / 1024
 
 
-def split_audio(audio_path: str, chunks_dir: str, chunk_seconds: int):
-    """
-    把长音频切成多个固定时长片段。
-    输出文件格式：chunk_000.wav, chunk_001.wav ...
-    """
-    chunks_path = Path(chunks_dir)
-    chunks_path.mkdir(parents=True, exist_ok=True)
-
-    output_pattern = str(chunks_path / "chunk_%03d.wav")
-
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i", audio_path,
-        "-f", "segment",
-        "-segment_time", str(chunk_seconds),
-        "-c", "copy",
-        output_pattern,
-    ]
-
-    run_command(command)
-
-    return sorted(chunks_path.glob("chunk_*.wav"))
+def save_uploaded_file(uploaded_file, save_path: Path):
+    with open(save_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
 
 
 def format_timestamp(seconds: float) -> str:
@@ -84,12 +55,104 @@ def format_timestamp(seconds: float) -> str:
     return f"{hours:02}:{minutes:02}:{secs:02},{milliseconds:03}"
 
 
+def is_video_file(path: Path) -> bool:
+    return path.suffix.lower() in [
+        ".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"
+    ]
+
+
+# =========================
+# FFmpeg 处理函数
+# =========================
+
+def extract_audio_from_video(video_path: str, audio_path: str):
+    """
+    从视频中提取音频，并统一转成 16kHz 单声道 WAV。
+    """
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i", video_path,
+        "-vn",
+        "-acodec", "pcm_s16le",
+        "-ar", "16000",
+        "-ac", "1",
+        audio_path,
+    ]
+
+    run_command(command)
+
+
+def split_audio(audio_path: str, chunks_dir: str, chunk_seconds: int):
+    """
+    将长音频切分为多个 WAV 片段。
+    每个片段再交给 Whisper 识别，避免一次性处理 1 小时音频导致内存爆掉。
+    """
+    chunks_path = Path(chunks_dir)
+    chunks_path.mkdir(parents=True, exist_ok=True)
+
+    output_pattern = str(chunks_path / "chunk_%04d.wav")
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i", audio_path,
+        "-f", "segment",
+        "-segment_time", str(chunk_seconds),
+        "-acodec", "pcm_s16le",
+        "-ar", "16000",
+        "-ac", "1",
+        output_pattern,
+    ]
+
+    run_command(command)
+
+    return sorted(chunks_path.glob("chunk_*.wav"))
+
+
+def get_media_duration_seconds(media_path: str) -> float | None:
+    """
+    使用 ffprobe 获取媒体时长。
+    如果获取失败，返回 None，不影响主流程。
+    """
+    if shutil.which("ffprobe") is None:
+        return None
+
+    command = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        media_path,
+    ]
+
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        return float(result.stdout.strip())
+    except Exception:
+        return None
+
+
+# =========================
+# Whisper 识别函数
+# =========================
+
 @st.cache_resource
 def load_model(model_size: str):
+    """
+    Streamlit Cloud 通常没有 GPU，因此强制使用 CPU + int8。
+    这样更稳、更省内存。
+    """
     return WhisperModel(
         model_size,
-        device="auto",
-        compute_type="auto",
+        device="cpu",
+        compute_type="int8",
     )
 
 
@@ -114,6 +177,7 @@ def transcribe_chunk(
 
     for segment in segments:
         text = segment.text.strip()
+
         if text:
             results.append({
                 "start": segment.start,
@@ -124,16 +188,22 @@ def transcribe_chunk(
     return results, info
 
 
+# =========================
+# 输出文件生成
+# =========================
+
 def make_txt(segments) -> str:
     return "\n".join(item["text"] for item in segments)
 
 
 def make_txt_with_time(segments) -> str:
     lines = []
+
     for item in segments:
         start = format_timestamp(item["start"])
         end = format_timestamp(item["end"])
         lines.append(f"[{start} --> {end}] {item['text']}")
+
     return "\n".join(lines)
 
 
@@ -152,29 +222,23 @@ def make_srt(segments) -> str:
     return "\n".join(lines)
 
 
-def save_uploaded_file(uploaded_file, save_path: Path):
-    with open(save_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-
-
-def get_file_size_mb(uploaded_file) -> float:
-    return uploaded_file.size / 1024 / 1024
-
-
 # =========================
-# 页面
+# 页面主体
 # =========================
 
-st.title("🎬 贵州话视频转文字 / 字幕工具")
+st.title("🎬 视频转文字 / 字幕工具")
 
 st.write(
-    "适合处理较长视频。系统会先提取音频，再把音频切成多个片段，逐段识别后合并结果。"
+    "上传原视频后，系统会在云端自动完成：视频保存、音频提取、音频切片、AI 识别、TXT/SRT 生成。"
+)
+
+st.warning(
+    "你选择的是全云端处理方案。1 小时视频可以尝试，但如果原视频过大，上传过程仍可能因网络或云端资源限制失败。"
 )
 
 if not check_ffmpeg_available():
     st.error(
-        "当前环境未检测到 FFmpeg。请确认 Streamlit Cloud 仓库根目录包含 `packages.txt`，"
-        "并且里面写了 `ffmpeg`。"
+        "当前环境未检测到 FFmpeg。请确认 GitHub 仓库根目录有 packages.txt，且内容为 ffmpeg。"
     )
     st.stop()
 
@@ -187,13 +251,16 @@ st.sidebar.header("识别参数")
 
 model_size = st.sidebar.selectbox(
     "Whisper 模型",
-    ["small", "medium", "large-v3"],
-    index=1,
-    help="贵州话建议先用 medium。large-v3 更准但更慢，云端可能资源不足。",
+    ["tiny", "base", "small", "medium"],
+    index=2,
+    help=(
+        "Streamlit Cloud 免费环境建议 small。"
+        "medium 可能更准，但 1 小时视频会更慢，也更容易内存不足。"
+    ),
 )
 
 language_option = st.sidebar.selectbox(
-    "语言设置",
+    "语言",
     ["中文", "自动识别"],
     index=0,
 )
@@ -206,97 +273,141 @@ language_map = {
 language = language_map[language_option]
 
 chunk_minutes = st.sidebar.selectbox(
-    "切片长度",
-    [3, 5, 10],
+    "音频切片长度",
+    [2, 3, 5, 10],
     index=1,
-    help="1 小时视频建议 5 分钟一段。机器配置较弱时选 3 分钟。",
+    help="1 小时视频建议 3 分钟一段。机器压力更小，更稳。"
 )
 
 initial_prompt = st.sidebar.text_area(
-    "方言识别提示词",
+    "贵州话识别提示词",
     value=(
         "这是贵州话、西南官话、贵州方言内容。"
-        "请尽量识别为中文，保留原意。"
-        "常见语气词和口语可以按普通中文记录。"
+        "请尽量识别为中文，保留说话原意。"
+        "对于方言语气词和口语表达，请尽量转写成通顺中文。"
+        "如果有地名、人名、村名、乡镇名，请尽量保留原文。"
     ),
-    height=120,
+    height=150,
+)
+
+show_video_preview = st.sidebar.checkbox(
+    "显示视频预览",
+    value=False,
+    help="大视频预览可能增加页面负担，默认关闭。"
 )
 
 st.sidebar.markdown("---")
-st.sidebar.write("建议：")
-st.sidebar.write("- 1 小时视频：切片 5 分钟")
-st.sidebar.write("- 普通部署：先用 medium")
-st.sidebar.write("- 口音重：再试 large-v3")
-st.sidebar.write("- 不建议用 tiny/base 处理贵州话")
+st.sidebar.write("推荐设置：")
+st.sidebar.write("- 模型：small")
+st.sidebar.write("- 语言：中文")
+st.sidebar.write("- 切片：3 分钟")
+st.sidebar.write("- 视频大小：尽量小于 1GB")
 
 
 # =========================
-# 上传与处理
+# 上传视频
 # =========================
 
 uploaded_file = st.file_uploader(
-    "上传视频文件",
+    "上传原视频文件",
     type=["mp4", "mov", "mkv", "avi", "webm", "m4v"],
 )
 
 if uploaded_file is None:
-    st.warning("请先上传一个视频文件。")
+    st.info("请上传一个视频文件。")
     st.stop()
 
 
 file_size_mb = get_file_size_mb(uploaded_file)
 file_stem = Path(uploaded_file.name).stem
+uploaded_suffix = Path(uploaded_file.name).suffix.lower()
 
 st.write(f"文件名：`{uploaded_file.name}`")
 st.write(f"文件大小：`{file_size_mb:.2f} MB`")
 
-with st.expander("预览视频", expanded=False):
-    st.video(uploaded_file)
+if file_size_mb > 1000:
+    st.error(
+        "该视频超过 1000MB。虽然配置允许上传，但 Streamlit Cloud 免费环境很可能不稳定。"
+    )
+elif file_size_mb > 500:
+    st.warning(
+        "该视频超过 500MB，上传和处理可能较慢。如果失败，建议换更高配置云服务器部署。"
+    )
 
-start_button = st.button("开始转文字", type="primary")
+if show_video_preview:
+    with st.expander("视频预览", expanded=False):
+        st.video(uploaded_file)
+
+start_button = st.button("开始云端转文字", type="primary")
+
+
+# =========================
+# 主处理流程
+# =========================
 
 if start_button:
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_dir = Path(temp_dir)
 
         video_path = temp_dir / uploaded_file.name
-        full_audio_path = temp_dir / "full_audio.wav"
+        extracted_audio_path = temp_dir / "extracted_audio.wav"
         chunks_dir = temp_dir / "chunks"
 
         try:
-            save_uploaded_file(uploaded_file, video_path)
-
             progress = st.progress(0)
             status = st.empty()
 
-            status.write("正在从视频中提取音频...")
+            # 1. 保存上传视频
+            status.write("步骤 1/5：正在保存上传的视频文件到云端临时目录...")
             progress.progress(5)
 
-            extract_audio(str(video_path), str(full_audio_path))
+            save_uploaded_file(uploaded_file, video_path)
 
-            status.write("正在切分长音频...")
-            progress.progress(12)
+            if not is_video_file(video_path):
+                st.error("不支持的视频格式。")
+                st.stop()
+
+            duration_seconds = get_media_duration_seconds(str(video_path))
+
+            if duration_seconds:
+                st.write(f"检测到视频时长：`{duration_seconds / 60:.1f} 分钟`")
+
+            # 2. 提取音频
+            status.write("步骤 2/5：正在从视频中提取音频...")
+            progress.progress(15)
+
+            extract_audio_from_video(
+                str(video_path),
+                str(extracted_audio_path),
+            )
+
+            # 3. 切分音频
+            status.write("步骤 3/5：正在切分长音频...")
+            progress.progress(30)
 
             chunk_seconds = chunk_minutes * 60
+
             chunk_paths = split_audio(
-                str(full_audio_path),
+                str(extracted_audio_path),
                 str(chunks_dir),
                 chunk_seconds,
             )
 
             if not chunk_paths:
-                st.error("音频切片失败，没有生成任何音频片段。")
+                st.error("音频切片失败，没有生成任何片段。")
                 st.stop()
 
+            total_chunks = len(chunk_paths)
+            st.write(f"已切分音频片段数：`{total_chunks}`")
+
+            # 4. 逐段识别
             all_segments = []
             detected_language = None
             detected_probability = None
 
-            total_chunks = len(chunk_paths)
-
             for index, chunk_path in enumerate(chunk_paths):
                 status.write(
-                    f"正在识别第 {index + 1} / {total_chunks} 段..."
+                    f"步骤 4/5：正在识别第 {index + 1} / {total_chunks} 段..."
                 )
 
                 chunk_segments, info = transcribe_chunk(
@@ -319,10 +430,11 @@ if start_button:
                     detected_language = info.language
                     detected_probability = info.language_probability
 
-                current_progress = 12 + int((index + 1) / total_chunks * 78)
+                current_progress = 30 + int((index + 1) / total_chunks * 60)
                 progress.progress(min(current_progress, 90))
 
-            status.write("正在生成结果文件...")
+            # 5. 生成结果
+            status.write("步骤 5/5：正在生成 TXT 和 SRT 文件...")
             progress.progress(95)
 
             txt_content = make_txt(all_segments)
@@ -330,22 +442,23 @@ if start_button:
             srt_content = make_srt(all_segments)
 
             progress.progress(100)
-            status.write("处理完成！")
+            status.write("处理完成。")
 
             st.success("转写完成")
 
             st.write(f"识别语言：`{detected_language}`")
+
             if detected_probability is not None:
                 st.write(f"语言置信度：`{detected_probability:.2f}`")
 
-            st.write(f"音频切片数：`{total_chunks}`")
             st.write(f"字幕段落数：`{len(all_segments)}`")
 
             st.subheader("转写预览")
+
             st.text_area(
                 "带时间戳文本",
                 txt_with_time_content,
-                height=350,
+                height=400,
             )
 
             st.subheader("下载结果")
@@ -384,6 +497,11 @@ if start_button:
         except RuntimeError as e:
             st.error("AI 模型加载或识别失败。")
             st.code(str(e))
+
+        except MemoryError:
+            st.error(
+                "云端内存不足。建议把模型改为 tiny/base，或换更高配置服务器部署。"
+            )
 
         except Exception as e:
             st.error("处理失败。")
