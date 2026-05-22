@@ -3,3 +3,5 @@ faster-whisper==1.2.1
 yt-dlp
 Pillow
 openai
+torch
+pyannote.audio
